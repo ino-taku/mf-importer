@@ -49,14 +49,13 @@ def download_csv(save_dir=".", headless=False):
             context.storage_state(path=str(STORAGE))
 
         # ---------------- 明細 → CSV ---------------- #
-        page.click('a:has-text("家計簿")')
-        page.click('a:has-text("明細")')
+            page.locator("a", has_text="ダウンロード").first.click()
 
-        with page.expect_download(timeout=DOWNLOAD_TIMEOUT * 1000) as dl:
-            page.click('role=button[name="CSVダウンロード"]')
-        download = dl.value
-        csv_path = save_dir / download.suggested_filename
-        download.save_as(csv_path)
+            with page.expect_download(timeout=DOWNLOAD_TIMEOUT * 1000) as dl:
+                page.get_by_role("link", name="CSVファイル").click()
+            download = dl.value
+            csv_path = save_dir / download.suggested_filename
+            download.save_as(csv_path)
 
         context.close()
         browser.close()
