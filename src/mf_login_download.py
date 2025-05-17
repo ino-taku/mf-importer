@@ -1,3 +1,6 @@
+import asyncio
+asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
+
 import os, sys, tempfile
 from pathlib import Path
 from dotenv import load_dotenv
