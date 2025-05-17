@@ -1,19 +1,23 @@
 import os, sys, tempfile
 from pathlib import Path
 from dotenv import load_dotenv
-from playwright.sync_api import sync_playwright
+from playwright.sync_api import sync_playwright, TimeoutError
 
+# ──────────────────────────────
+# パス設定
+# ──────────────────────────────
 BASE_DIR = Path(__file__).resolve().parent.parent
-STORAGE = BASE_DIR / "storageState.json"
+STORAGE  = BASE_DIR / "storageState.json"
 
-# .env 読込
+# .env 読み込み
 load_dotenv(BASE_DIR / ".env")
 
 DOWNLOAD_TIMEOUT = 60  # 秒
 
 
 def download_csv(save_dir=".", headless=False):
-    email = os.getenv("MF_EMAIL")
+    """MoneyForward にログインし、最新 CSV をダウンロードしてファイルパスを返す"""
+    email    = os.getenv("MF_EMAIL")
     password = os.getenv("MF_PASSWORD")
 
     save_dir = Path(save_dir)
@@ -25,16 +29,15 @@ def download_csv(save_dir=".", headless=False):
             args=["--disable-dev-shm-usage"],
         )
 
-        # ---------------- Cookie 優先 ---------------- #
+        # ── 1. コンテキスト作成 ───────────────────────
         if STORAGE.exists():
             context = browser.new_context(
                 storage_state=str(STORAGE),
                 accept_downloads=True,
             )
             page = context.new_page()
-            page.goto("https://moneyforward.com/cf")  # ダッシュボードへ直行
+            page.goto("https://moneyforward.com/cf")               # ダッシュボード直行
         else:
-            # ---------- 初回のみメール/パスでログイン ----------
             if not (email and password):
                 raise EnvironmentError("MF_EMAIL / MF_PASSWORD が未設定です")
 
@@ -45,28 +48,40 @@ def download_csv(save_dir=".", headless=False):
             page.fill('input[name="password"]', password)
             page.click('button[type="submit"]')
             page.wait_for_url("**/home")
-            # Cookie を保存
+            # Cookie 保存
             context.storage_state(path=str(STORAGE))
 
-        # ---------------- 明細 → CSV ---------------- #
-            page.locator("a", has_text="ダウンロード").first.click()
+        # ── 2. CSV ダウンロード ──────────────────────
+        try:
+            # 「ダウンロード」ドロップダウンを hover で開く
+            dl_btn = page.locator('a', has_text='ダウンロード').first
+            dl_btn.hover()
+            page.wait_for_timeout(300)           # アニメーション待ち
 
-            with page.expect_download(timeout=DOWNLOAD_TIMEOUT * 1000) as dl:
-                page.get_by_role("link", name="CSVファイル").click()
-            download = dl.value
+            with page.expect_download(timeout=DOWNLOAD_TIMEOUT * 1000) as dl_info:
+                page.locator('a', has_text='CSVファイル').click()
+
+            download = dl_info.value
             csv_path = save_dir / download.suggested_filename
             download.save_as(csv_path)
 
+        except TimeoutError:
+            raise RuntimeError(
+                "CSV ダウンロードが開始されませんでした。セレクタを再確認してください。"
+            )
+
         context.close()
         browser.close()
+
     return csv_path
 
 
+# ── CLI 用エントリポイント ─────────────────────────
 if __name__ == "__main__":
     import argparse
 
     ap = argparse.ArgumentParser()
-    ap.add_argument("--headless", action="store_true")
+    ap.add_argument("--headless", action="store_true", help="ヘッドレスモードで実行")
     args = ap.parse_args()
 
     try:
