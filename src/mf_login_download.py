@@ -1,25 +1,22 @@
-import asyncio
-asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
+# ── 最優先：Windows で SelectorEventLoop を使う ─────────
+import sys, asyncio
+if sys.platform.startswith("win"):
+    asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
 
-import os, sys, tempfile
+# ── 以降は通常インポート ─────────────────────────────
+import os, tempfile
 from pathlib import Path
 from dotenv import load_dotenv
 from playwright.sync_api import sync_playwright, TimeoutError
 
-# ──────────────────────────────
-# パス設定
-# ──────────────────────────────
 BASE_DIR = Path(__file__).resolve().parent.parent
 STORAGE  = BASE_DIR / "storageState.json"
-
-# .env 読み込み
 load_dotenv(BASE_DIR / ".env")
 
 DOWNLOAD_TIMEOUT = 60  # 秒
 
 
 def download_csv(save_dir=".", headless=False):
-    """MoneyForward にログインし、最新 CSV をダウンロードしてファイルパスを返す"""
     email    = os.getenv("MF_EMAIL")
     password = os.getenv("MF_PASSWORD")
 
@@ -32,14 +29,14 @@ def download_csv(save_dir=".", headless=False):
             args=["--disable-dev-shm-usage"],
         )
 
-        # ── 1. コンテキスト作成 ───────────────────────
+        # ---------- コンテキスト作成 ----------
         if STORAGE.exists():
             context = browser.new_context(
                 storage_state=str(STORAGE),
                 accept_downloads=True,
             )
             page = context.new_page()
-            page.goto("https://moneyforward.com/cf")               # ダッシュボード直行
+            page.goto("https://moneyforward.com/cf")
         else:
             if not (email and password):
                 raise EnvironmentError("MF_EMAIL / MF_PASSWORD が未設定です")
@@ -51,27 +48,22 @@ def download_csv(save_dir=".", headless=False):
             page.fill('input[name="password"]', password)
             page.click('button[type="submit"]')
             page.wait_for_url("**/home")
-            # Cookie 保存
             context.storage_state(path=str(STORAGE))
 
-        # ── 2. CSV ダウンロード ──────────────────────
+        # ---------- CSV ダウンロード ----------
         try:
-            # 「ダウンロード」ドロップダウンを hover で開く
-            dl_btn = page.locator('a', has_text='ダウンロード').first
-            dl_btn.hover()
-            page.wait_for_timeout(300)           # アニメーション待ち
+            page.locator("a", has_text="ダウンロード").first.hover()
+            page.wait_for_timeout(300)                 # メニュー描画待ち
 
             with page.expect_download(timeout=DOWNLOAD_TIMEOUT * 1000) as dl_info:
-                page.locator('a', has_text='CSVファイル').click()
+                page.locator("a", has_text="CSVファイル").click()
 
             download = dl_info.value
             csv_path = save_dir / download.suggested_filename
             download.save_as(csv_path)
 
         except TimeoutError:
-            raise RuntimeError(
-                "CSV ダウンロードが開始されませんでした。セレクタを再確認してください。"
-            )
+            raise RuntimeError("CSV ダウンロードが開始されませんでした。セレクタを再確認してください。")
 
         context.close()
         browser.close()
@@ -79,14 +71,11 @@ def download_csv(save_dir=".", headless=False):
     return csv_path
 
 
-# ── CLI 用エントリポイント ─────────────────────────
 if __name__ == "__main__":
-    import argparse
-
+    import argparse, sys
     ap = argparse.ArgumentParser()
-    ap.add_argument("--headless", action="store_true", help="ヘッドレスモードで実行")
+    ap.add_argument("--headless", action="store_true", help="ヘッドレスモードにする")
     args = ap.parse_args()
-
     try:
         out = download_csv(tempfile.gettempdir(), headless=args.headless)
         print(f"Downloaded: {out}")
