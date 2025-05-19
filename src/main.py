@@ -1,0 +1,18 @@
+﻿import asyncio, tempfile
+from mf_login_download import download_csv_async           # 既存
+from normalize          import normalize                   # 既存
+from gsheet             import upload_df                   # 既存
+
+async def run_once() -> None:
+    # 1) MoneyForward から最新 CSV を落とす
+    csv = await download_csv_async(tempfile.gettempdir(), headless=True)
+
+    # 2) pandas DataFrame に正規化
+    df  = normalize(csv)
+
+    # 3) Google Sheets へアップロード
+    upload_df(df, worksheet='raw_csv')
+    print('✓ Upload complete:', csv)
+
+if __name__ == '__main__':
+    asyncio.run(run_once())
