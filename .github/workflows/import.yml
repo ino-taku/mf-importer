@@ -1,0 +1,32 @@
+﻿name: Daily MoneyForward import
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '0 0 * * *'
+
+jobs:
+  import:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          playwright install --with-deps
+          sudo apt-get update -y
+          sudo apt-get install -y jq
+      - name: Run importer (headless)
+        env:
+          MF_EMAIL:            ${{ secrets.MF_EMAIL }}
+          MF_PASSWORD:         ${{ secrets.MF_PASSWORD }}
+          GSHEET_KEY:          ${{ secrets.GSHEET_KEY }}
+          GSHEET_SERVICE_JSON: ${{ secrets.GSHEET_SERVICE_JSON }}
+        run: |
+          python -m src.main
