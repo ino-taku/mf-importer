@@ -1,89 +1,120 @@
 # src/mf_login_download.py
-# ---------------------------------------------------------------------------
-# MoneyForward 家計簿から CSV をダウンロードするユーティリティ
-# * ローカル: GUI/ヘッドレスどちらでも可
-# * GitHub Actions (ubuntu-latest): --no-sandbox 等を自動付与
-# ---------------------------------------------------------------------------
+#
+# MoneyForward から “収入・支出詳細” CSV をダウンロードするユーティリティ
+# ------------------------------------------------------------
+# ・環境変数 MF_EMAIL / MF_PASSWORD で認証
+# ・Playwright（async）を使用
+# ・ヘッドレス／GUI は引数で切替
+# ------------------------------------------------------------
+from __future__ import annotations
+
+import argparse
 import asyncio
 import os
-import sys
 import tempfile
-from pathlib import Path
 from datetime import datetime
+from pathlib import Path
+from typing import Final
 
 from playwright.async_api import async_playwright, TimeoutError as PWTimeout
 
+MF_ID_URL:   Final = "https://id.moneyforward.com/sign_in"
+MF_CF_URL:   Final = "https://moneyforward.com/cf"
 
-# GitHub Actions(Linux) の headless Chrome を安定させる追加フラグ
-EXTRA_ARGS = ["--no-sandbox", "--disable-dev-shm-usage"]
+EMAIL  = os.getenv("MF_EMAIL")
+PWD    = os.getenv("MF_PASSWORD")
 
-# 家計簿トップとダウンロード用リンク
-HOME_URL = "https://moneyforward.com/cf"
-DL_MENU_SELECTOR = 'a:has-text("ダウンロード")'
-CSV_LINK_SELECTOR = 'a:has-text("CSVファイル")'
+if not EMAIL or not PWD:
+    raise EnvironmentError("MF_EMAIL / MF_PASSWORD が環境変数に設定されていません。")
 
 
+# ----------------------------------------------------------------------
+# 内部ヘルパ
+# ----------------------------------------------------------------------
 async def _login(page) -> None:
-    """MoneyForward ID ログイン"""
-    await page.goto("https://id.moneyforward.com/sign_in", wait_until="networkidle")
+    """MoneyForward ID でログイン (必要ならメールリンクをクリックして展開)"""
+    await page.goto(MF_ID_URL, wait_until="domcontentloaded")
 
-    email = os.environ["MF_EMAIL"]
-    password = os.environ["MF_PASSWORD"]
+    # --- フォームを開く -------------------------------------------------
+    # 「メールアドレスでログイン」リンクがあればクリック
+    if await page.locator('text="メールアドレスでログイン"').count():
+        await page.click('text="メールアドレスでログイン"')
 
+    # 入力欄が現れるまで最大 90 秒待つ
     try:
-        await page.fill('input[name="email"]', email, timeout=60_000)
-        await page.fill('input[name="password"]', password)
-        await page.click('button[type="submit"]')
-    except PWTimeout:
-        raise RuntimeError("ログインフォームが描画されずタイムアウトしました")
+        await page.wait_for_selector('input[name="email"]', timeout=90_000)
+    except PWTimeout as e:
+        raise RuntimeError("ログインフォームが描画されずタイムアウトしました") from e
+
+    # --- 認証情報を入力 -------------------------------------------------
+    await page.fill('input[name="email"]', EMAIL)
+    await page.fill('input[name="password"]', PWD)
+    await page.click('button[type="submit"]')
+
+    # 完全に遷移するまで待機
+    await page.wait_for_url(lambda url: "sign_in" not in url, timeout=90_000)
 
 
-async def _download_csv(page, tmp_dir: str) -> str:
-    """家計簿画面から CSV をダウンロードし、保存先パスを返す"""
-    await page.goto(HOME_URL, wait_until="domcontentloaded")
+# ----------------------------------------------------------------------
+# 外部 API
+# ----------------------------------------------------------------------
+async def download_csv_async(tmp_dir: str | Path, *, headless: bool = True) -> Path:
+    """
+    CSV を tmp_dir に保存してその Path を返す
+    """
+    tmp_dir = Path(tmp_dir)
+    tmp_dir.mkdir(parents=True, exist_ok=True)
 
-    # 「ダウンロード」メニュー → 「CSVファイル」クリック
-    await page.locator(DL_MENU_SELECTOR).click()
-    async with page.expect_download() as dl_info:
-        await page.locator(CSV_LINK_SELECTOR).click()
-    download = await dl_info.value
-
-    # 保存ファイル名を明示したいのでここで move
-    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-    dst = Path(tmp_dir) / f"mf_{ts}.csv"
-    await download.save_as(str(dst))
-    return str(dst)
-
-
-async def download_csv_async(tmp_dir: str, *, headless: bool = True) -> str:
-    """CSV を非同期で取得しファイルパスを返す"""
     async with async_playwright() as p:
-        launch_opts = {"headless": headless}
-        if headless and sys.platform == "linux":
-            launch_opts["args"] = EXTRA_ARGS
-
-        browser = await p.chromium.launch(**launch_opts)
+        browser = await p.chromium.launch(headless=headless, args=["--no-sandbox"])
         context = await browser.new_context(
-            **p.devices["Desktop Chrome HiDPI"], locale="ja-JP"
+            **(p.devices["Desktop Chrome HiDPI"] if headless else {})
         )
         page = await context.new_page()
 
-        await _login(page)
-        csv_path = await _download_csv(page, tmp_dir)
+        # ログインが必要かどうかを判定
+        await page.goto(MF_CF_URL, wait_until="domcontentloaded")
+        if "sign_in" in page.url:
+            await _login(page)
+            await page.goto(MF_CF_URL, wait_until="networkidle")
+
+        # ダウンロードメニューを開く
+        # 家計簿ページの上部バーにあるアイコン (DOM 側は <i class="icon-download-alt">)
+        await page.click('i.icon-download-alt')
+
+        # "CSVファイル" をクリックして download
+        async with page.expect_download() as dl_info:
+            await page.get_by_role("link", name="CSVファイル").click()
+        dl = await dl_info.value
+
+        # ファイル名を日付入りで置き換え保存
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        csv_path = tmp_dir / f"収入・支出詳細_{ts}.csv"
+        await dl.save_as(csv_path)
 
         await context.close()
         await browser.close()
-        return csv_path
+
+    return csv_path
 
 
-# ---------------------------------------------------------------------------
-# CLI 兼 同期ラッパー
-# ---------------------------------------------------------------------------
-def download_csv(tmp_dir: str, *, headless: bool = True) -> str:
-    """同期で呼び出したい場合用のラッパー"""
-    return asyncio.run(download_csv_async(tmp_dir, headless=headless))
+# ----------------------------------------------------------------------
+# CLI
+# ----------------------------------------------------------------------
+def _cli() -> None:
+    parser = argparse.ArgumentParser(description="MoneyForward CSV downloader")
+    parser.add_argument(
+        "--headless", action="store_true", help="Run browser in headless mode (default)"
+    )
+    parser.add_argument(
+        "--with-gui", action="store_true", help="Run browser with GUI (overrides --headless)"
+    )
+    args = parser.parse_args()
+
+    headless = not args.with_gui
+    out = asyncio.run(download_csv_async(tempfile.gettempdir(), headless=headless))
+    print(f"✓ Downloaded: {out}")
 
 
 if __name__ == "__main__":
-    path = download_csv(tempfile.gettempdir(), headless=("--headful" not in sys.argv))
-    print("Downloaded:", path)
+    _cli()
