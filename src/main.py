@@ -1,5 +1,5 @@
 ﻿import asyncio, tempfile
-from mf_login_download import download_csv_async
+from .mf_login_download import download_csv_async
 from normalize          import normalize
 from gsheet             import upload_df
 
