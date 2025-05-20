@@ -14,30 +14,39 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
+      # 1) コードをチェックアウト
       - name: Checkout code
         uses: actions/checkout@v4
 
-      # vendor 化しておいた upload-artifact
+      # 2) upload-artifact アクションをローカルに取得
       - name: Checkout upload-artifact action
         uses: actions/checkout@v4
         with:
           repository: actions/upload-artifact
           path: ./.github/actions/upload-artifact
 
+      # 3) Python セットアップ
       - name: Set up Python
         uses: actions/setup-python@v4
         with:
           python-version: '3.12'
 
+      # 4) 依存関係をインストール
       - name: Install dependencies
         run: pip install -r requirements.txt
 
+      # 5) Playwright のブラウザをインストール
+      - name: Install Playwright browsers
+        run: python -m playwright install --with-deps
+
+      # 6) 実行対象の年月を取得
       - name: Get year/month
         id: yymm
         run: |
           echo "year=$(date -u +'%Y')"   >> $GITHUB_OUTPUT
           echo "month=$(date -u +'%m')"  >> $GITHUB_OUTPUT
 
+      # 7) インポーターを実行
       - name: Run importer
         env:
           MF_EMAIL:       ${{ secrets.MF_EMAIL }}
@@ -47,6 +56,7 @@ jobs:
           MONTH:          ${{ steps.yymm.outputs.month }}
         run: python -m src.main
 
+      # 8) 失敗時にスクリーンショットをアップロード
       - name: Upload login screenshot on failure
         if: failure()
         uses: ./.github/actions/upload-artifact
