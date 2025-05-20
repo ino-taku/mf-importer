@@ -1,12 +1,14 @@
 import asyncio, base64, gzip, os, re, tempfile
 from pathlib import Path
-from playwright.async_api import async_playwright, TimeoutError as PWTimeout, Page
+from playwright.async_api import async_playwright, Page, TimeoutError as PWTimeout
 
 HOME_URL    = "https://moneyforward.com/"
 DL_PAGE_URL = "https://moneyforward.com/cf/csv"
-WAIT        = 30_000           # ms
+WAIT        = 30_000
 STORAGE_ENV = "MF_STORAGE_B64"
-CSV_RE      = re.compile(r"csv", re.I)
+
+# ASCII / 全角どちらでもマッチ
+CSV_RE = re.compile(r"[cｃCＣ][sｓSＳ][vｖVＶ]", re.I)
 
 # ---------- storageState ----------
 def _decode_storage() -> Path | None:
@@ -22,66 +24,63 @@ def _decode_storage() -> Path | None:
     tmp.write_bytes(raw)
     return tmp
 
-# ---------- 汎用: “CSV” を探す -------------
-async def _scan_for_csv(page_or_frame):
-    # 直リンク .csv
-    link = page_or_frame.locator('a[href$=".csv"], a[href*=".csv?"]')
+# ---------- 汎用: “CSV” を探す ----------
+async def _scan_for_csv(scope):
+    # 1)  href*.csv
+    link = scope.locator('a[href$=".csv"], a[href*=".csv?"]')
     if await link.count():
         return link.first
 
-    # role≠presentation で “CSV” を含むテキスト
-    node = page_or_frame.locator(
+    # 2)  全角/半角「CSV」を含む可視テキスト
+    node = scope.locator(
         ':is(a,button,span,div,li):not([role="presentation"])',
         has_text=CSV_RE
     )
     if await node.count():
         return node.first
+
+    # 3)  「CSVファイル」「ＣＳＶファイル」など
+    node2 = scope.locator(':is(a,button):text-matches("Ｃ?Ｓ?Ｖ?ファイル")')
+    if await node2.count():
+        return node2.first
+
     return None
 
-# ---------- CSV リンク探索 -------------
+# ---------- CSV リンク探索 ----------
 async def _find_csv_link(page: Page):
     async def _try_everywhere():
-        # 1) メインページ
+        # main frame
         if (hit := await _scan_for_csv(page)):
             return hit
-        # 2) iframe 内
-        for frame in page.frames:
-            if frame is not page.main_frame:
-                if (hit := await _scan_for_csv(frame)):
-                    return hit
+        # sub-frames
+        for f in page.frames:
+            if f is not page.main_frame and (hit := await _scan_for_csv(f)):
+                return hit
         return None
 
-    # ---- A. そのまま
+    # 直撃
     if (hit := await _try_everywhere()):
         return hit
 
-    # ---- B. download-icon
+    # ダウンロードアイコン → ドロップダウン開く
     icon = page.locator('i[class*="download"], i.icon-download-alt')
     if await icon.count():
         await icon.first.click()
-        await page.wait_for_timeout(1_000)
+        await page.wait_for_timeout(800)
         if (hit := await _try_everywhere()):
             return hit
 
-    # ---- C. dropdown-button
-    dd_btn = page.locator('button[data-toggle="dropdown"], .dropdown-toggle')
-    if await dd_btn.count():
-        await dd_btn.first.click()
-        await page.wait_for_timeout(1_000)
-        if (hit := await _try_everywhere()):
-            return hit
-
-    # ---- D. スクロールしながらリトライ
-    for _ in range(3):
+    # さらにスクロールしながらリトライ
+    for _ in range(4):
         await page.mouse.wheel(0, 800)
-        await page.wait_for_timeout(500)
+        await page.wait_for_timeout(400)
         if (hit := await _try_everywhere()):
             return hit
 
     raise RuntimeError("CSV ダウンロードリンクを検出できませんでした")
 
 # ---------- メイン ----------
-async def download_csv_async(out_dir: str, headless: bool = True):
+async def download_csv_async(out_dir: str, *, headless: bool = True):
     storage = _decode_storage()
     async with async_playwright() as p:
         browser = await p.chromium.launch(headless=headless)
@@ -97,11 +96,11 @@ async def download_csv_async(out_dir: str, headless: bool = True):
 
         # Download オブジェクト or Locator
         if hasattr(target, "save_as"):
-            download = target            # すでに Download
+            download = target
         else:
-            async with page.expect_download(timeout=WAIT) as dl_info:
+            async with page.expect_download(timeout=WAIT) as dlinfo:
                 await target.click()
-            download = await dl_info.value
+            download = await dlinfo.value
 
         dst = Path(out_dir) / download.suggested_filename
         await download.save_as(dst)
