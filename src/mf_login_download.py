@@ -52,7 +52,7 @@ async def _scan_for_csv(scope: Page):
 async def _find_csv_link(page: Page):
     async def _try_everywhere():
         # main frame
-        if (hit := await _scan_for_csv(page)):
+        if hit := await _scan_for_csv(page):
             return hit
         # sub-frames
         for f in page.frames:
@@ -60,16 +60,27 @@ async def _find_csv_link(page: Page):
                 return hit
         return None
 
-    if (hit := await _try_everywhere()):
+    if hit := await _try_everywhere():
         return hit
 
-    # エクスポート画面はフォーム１つ＋submit１つだけの場合が多い → 自動で拾う
+    # フォームに submit 1 個だけパターン
     submit_only = page.locator('form input[type="submit"]')
     if await submit_only.count() == 1:
         return submit_only.first
 
-    raise RuntimeError("CSV ダウンロードリンクを検出できませんでした")
+    # ---------- failure debug ----------
+    html = await page.content()
+    head = "\n".join(html.splitlines()[:200])
+    tail = "\n".join(html.splitlines()[-50:])
+    print("===== page.content() head =====")
+    print(head)
+    print("===== page.content() tail =====")
+    print(tail)
+    print(f"URL   : {page.url}")
+    print(f"title : {await page.title()}")
+    print("================================")
 
+    raise RuntimeError("CSV ダウンロードリンクを検出できませんでした")
 # ---------- メイン ----------
 async def download_csv_async(out_dir: str, *, headless: bool = True):
     storage = _decode_storage()
