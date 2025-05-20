@@ -1,61 +1,67 @@
-import asyncio, os, tempfile, time, base64, json
+import asyncio, os, base64, json, tempfile, time
 from pathlib import Path
 from playwright.async_api import async_playwright
 
-LOGIN_URL   = "https://moneyforward.com/cf"
-EMAIL_SELECTOR = 'input[name="email"], input[name="mfid_user[email]"]'
-PASS_SELECTOR  = 'input[type="password"], input[name="mfid_user[password]"]'
-DL_MENU_TEXT   = "ダウンロード"
-CSV_LINK_TEXT  = "CSVファイル"
+LOGIN_URL        = "https://moneyforward.com/cf"
+DL_MENU_TEXT     = "ダウンロード"
+CSV_LINK_TEXT    = "CSVファイル"
 
+EMAIL_SELECTOR   = 'input[name="email"], input[name="mfid_user[email]"]'
+PASS_SELECTOR    = 'input[type="password"], input[name="mfid_user[password]"]'
+
+# ---------- 1. ログイン -------------------------------------------------- #
 async def _login(page):
-    email    = os.environ["MF_EMAIL"]
-    password = os.environ["MF_PASSWORD"]
+    email, password = os.environ["MF_EMAIL"], os.environ["MF_PASSWORD"]
 
     try:
         await page.wait_for_selector(EMAIL_SELECTOR, timeout=90_000)
         await page.fill(EMAIL_SELECTOR, email)
         await page.fill(PASS_SELECTOR,  password)
         await page.press(PASS_SELECTOR, "Enter")
+        await page.wait_for_url("**/cf", timeout=90_000)
     except Exception as e:
         raise RuntimeError("ログインフォームが描画されずタイムアウトしました") from e
 
-    # ログイン完了待ち（サイドバーが出るなど）
-    await page.wait_for_url("**/cf", timeout=90_000)
-
-async def _restore_storage(context):
+# ---------- 2. storageState → temp ファイル ----------------------------- #
+def _storage_state_file() -> Path | None:
     b64 = os.getenv("MF_STORAGE_B64")
     if not b64:
-        return False
-    state_path = Path(tempfile.gettempdir()) / f"mf_state_{int(time.time())}.json"
-    state_path.write_bytes(base64.b64decode(b64))
-    await context.add_cookies([])
-    context.storage_state(path=str(state_path))
-    return True
+        return None
+    path = Path(tempfile.gettempdir()) / f"mf_state_{int(time.time())}.json"
+    path.write_bytes(base64.b64decode(b64))
+    return path
 
-async def download_csv_async(tmpdir: str, headless=True) -> Path:
+# ---------- 3. メイン ---------------------------------------------------- #
+async def download_csv_async(tmpdir: str, *, headless: bool = True) -> Path:
     async with async_playwright() as p:
         browser = await p.chromium.launch(headless=headless)
-        context = await browser.new_context()
-        page    = await context.new_page()
 
-        # ① Cookie 復元（あれば）
-        if not await _restore_storage(context):
+        # Cookie があれば読み込む
+        state_file = _storage_state_file()
+        context = await browser.new_context(
+            storage_state=str(state_file) if state_file else None
+        )
+        page = await context.new_page()
+
+        if not state_file:                             # Cookie が無いときだけログイン
             await page.goto(LOGIN_URL)
             await _login(page)
 
-            # 新しい storageState を出力（ローカル開発用）
-            state = await context.storage_state()
-            (Path(tmpdir) / "storageState.json").write_text(json.dumps(state, ensure_ascii=False))
+            # 取得した Cookie をローカルに保存（開発用）
+            new_state_path = Path(tmpdir) / "storageState.json"
+            new_state_path.write_bytes(
+                json.dumps(await context.storage_state()).encode("utf-8")
+            )
 
-        # ② CSV ダウンロード
+        # ------- CSV ダウンロード ------- #
         await page.goto(LOGIN_URL)
         await page.get_by_role("link", name=DL_MENU_TEXT).click()
         async with page.expect_download(timeout=60_000) as dl_info:
             await page.get_by_role("link", name=CSV_LINK_TEXT).click()
-        download = await dl_info.value
-        out_path = Path(tmpdir) / download.suggested_filename
-        await download.save_as(out_path)
+
+        dl      = await dl_info.value
+        csv_out = Path(tmpdir) / dl.suggested_filename
+        await dl.save_as(csv_out)
 
         await browser.close()
-        return out_path
+        return csv_out
