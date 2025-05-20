@@ -12,44 +12,48 @@ import tempfile
 from pathlib import Path
 from typing import Final
 
-from playwright.async_api import async_playwright, Page, BrowserContext
+from playwright.async_api import async_playwright, BrowserContext, Page
 
 LOGIN_URL: Final = "https://id.moneyforward.com/sign_in"
 CSV_URL_TPL: Final = (
     "https://moneyforward.com/cf/csv?from={y}/{m:02d}/01&month={m}&year={y}"
 )
 
+# ──────────────────────────────────────────────────────────
+EMAIL_SEL = 'input[name="email"], input[name="mfid_user[email]"]'
+PASS_SEL = 'input[type="password"]'
+SUBMIT_SEL = 'button[type="submit"]'
+# ──────────────────────────────────────────────────────────
 
-# ---------- 共通ユーティリティ ---------- #
+
 def _decode_storage_state(b64: str) -> Path:
-    """
-    env:MF_STORAGE_B64 を bytes に戻し（必要なら gunzip して）一時ファイルへ保存
-    """
-    data = base64.b64decode(b64)
-
-    # gzip されていれば解凍（先頭 2 byte = 0x1f 0x8b）
-    if data[:2] == b"\x1f\x8b":
-        data = gzip.decompress(data)
-
-    # validate
-    json.loads(data.decode())  # ←壊れていればここで例外
-
+    """env:MF_STORAGE_B64 → bytes → (必要なら gunzip) → JSON → 一時ファイル"""
+    raw = base64.b64decode(b64)
+    if raw[:2] == b"\x1f\x8b":
+        raw = gzip.decompress(raw)
+    json.loads(raw.decode())  # validation
     fp = Path(tempfile.mkdtemp()) / "state.json"
-    fp.write_bytes(data)
+    fp.write_bytes(raw)
     return fp
 
 
 async def _login_if_needed(page: Page) -> None:
+    """Cookie が有効なら何もしない。未ログインならフォームに入力して submit"""
     if page.url.startswith("https://moneyforward.com"):
         return
+
     await page.goto(LOGIN_URL, wait_until="load")
-    await page.fill('input[name="mfid_user[email]"]', os.environ["MF_EMAIL"])
-    await page.fill('input[name="mfid_user[password]"]', os.environ["MF_PASSWORD"])
+
+    # フォームがどちらの DOM でも取れるように待機
+    await page.wait_for_selector(EMAIL_SEL, timeout=60_000)
+
+    await page.fill(EMAIL_SEL, os.environ["MF_EMAIL"])
+    await page.fill(PASS_SEL, os.environ["MF_PASSWORD"])
+
     async with page.expect_navigation():
-        await page.click('button[type="submit"]')
+        await page.click(SUBMIT_SEL)
 
 
-# ---------- メイン ---------- #
 async def download_csv_async(
     out_dir: str | os.PathLike,
     year: int,
@@ -57,22 +61,14 @@ async def download_csv_async(
     *,
     headless: bool = True,
 ) -> Path:
-    """
-    :param out_dir:   保存先ディレクトリ
-    :param year:      取得する年 (e.g. 2025)
-    :param month:     取得する月 (1-12)
-    :returns:         保存した CSV の Path
-    """
-
-    storage_state_file: str | None = None
-    if (b64 := os.getenv("MF_STORAGE_B64")):
+    """指定年月の CSV をダウンロードし out_dir に保存して Path を返す"""
+    storage_state_file = None
+    if b64 := os.getenv("MF_STORAGE_B64"):
         storage_state_file = str(_decode_storage_state(b64))
 
     async with async_playwright() as pw:
         browser = await pw.chromium.launch(headless=headless)
-        context: BrowserContext = await browser.new_context(
-            storage_state=storage_state_file
-        )
+        context: BrowserContext = await browser.new_context(storage_state=storage_state_file)
         page = await context.new_page()
 
         await _login_if_needed(page)
@@ -91,6 +87,6 @@ async def download_csv_async(
         return out_path
 
 
-# 手動デバッグ用
+# 手動実行用
 if __name__ == "__main__":
     asyncio.run(download_csv_async(tempfile.gettempdir(), 2025, 5, headless=False))
