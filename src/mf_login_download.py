@@ -1,110 +1,119 @@
-import asyncio, base64, gzip, os, re, tempfile
+import asyncio
+import gzip
+import os
+import tempfile
+from datetime import date
 from pathlib import Path
-from playwright.async_api import async_playwright, Page, TimeoutError as PWTimeout
+from typing import Optional
 
-HOME_URL    = "https://moneyforward.com/"
-DL_PAGE_URL = "https://moneyforward.com/cf/export"   # ← 修正
-WAIT        = 30_000
-STORAGE_ENV = "MF_STORAGE_B64"
+from playwright.async_api import async_playwright, Browser, Page
 
-# ASCII / 全角どちらでもマッチ
-CSV_RE = re.compile(r"[cｃCＣ][sｓSＳ][vｖVＶ]", re.I)
+# ==== 環境変数 ====
+import base64
+import json
+import os
 
-# ---------- storageState ----------
-def _decode_storage() -> Path | None:
-    b64 = os.getenv(STORAGE_ENV)
-    if not b64:
+MF_EMAIL = os.getenv("MF_EMAIL")
+MF_PASSWORD = os.getenv("MF_PASSWORD")
+MF_STORAGE_B64 = os.getenv("MF_STORAGE_B64")  # gzip+base64 or plain base64
+
+LOGIN_URL = "https://id.moneyforward.com/sign_in"
+CSV_BASE = "https://moneyforward.com/cf/csv"
+
+# ------------------------------------------------------------------------------
+# 内部ヘルパ
+# ------------------------------------------------------------------------------
+
+
+async def _login(page: Page) -> None:
+    """メール＋パスワードでサインイン。二要素認証には未対応。"""
+    await page.goto(LOGIN_URL)
+    await page.fill('input[name="mfid_user[email]"]', MF_EMAIL)
+    await page.fill('input[name="mfid_user[password]"]', MF_PASSWORD)
+    # ログイン → 自動リダイレクト完了を待つ
+    async with page.expect_navigation(url_regex=r"https://moneyforward\.com/.*"):
+        await page.click('button[type="submit"]')
+
+
+def _build_csv_url(year: int, month: int) -> str:
+    from_day = date(year, month, 1)
+    return (
+        f"{CSV_BASE}"
+        f"?from={from_day:%Y/%m/%d}"
+        f"&month={month}"
+        f"&year={year}"
+    )
+
+
+def _decode_storage() -> Optional[dict]:
+    """MF_STORAGE_B64 → dict（Playwright storageState 形式）"""
+    if not MF_STORAGE_B64:
         return None
-    raw = base64.b64decode(b64)
+    raw = base64.b64decode(MF_STORAGE_B64)
     try:
         raw = gzip.decompress(raw)
-    except OSError:
-        pass
-    tmp = Path(tempfile.gettempdir()) / "storageState.json"
-    tmp.write_bytes(raw)
-    return tmp
+    except gzip.BadGzipFile:
+        pass  # 非 gzip
+    return json.loads(raw)
 
-# ---------- 汎用: “CSV” を探す ----------
-async def _scan_for_csv(scope: Page):
-    # a)  href に .csv
-    link = scope.locator('a[href$=".csv"], a[href*=".csv?"]')
-    if await link.count():
-        return link.first
 
-    # b)  テキストに CSV
-    node = scope.locator(
-        ':is(a,button,input,span,div,li):not([role="presentation"])',
-        has_text=CSV_RE
-    )
-    if await node.count():
-        return node.first
+# ------------------------------------------------------------------------------
+# 公開 API
+# ------------------------------------------------------------------------------
 
-    # c)  submit ボタン value に CSV
-    btn = scope.locator('input[type="submit"]')
-    for i in range(await btn.count()):
-        v = (await btn.nth(i).get_attribute("value")) or ""
-        if CSV_RE.search(v):
-            return btn.nth(i)
 
-    return None
-
-# ---------- CSV リンク探索 ----------
-async def _find_csv_link(page: Page):
-    async def _try_everywhere():
-        # main frame
-        if hit := await _scan_for_csv(page):
-            return hit
-        # sub-frames
-        for f in page.frames:
-            if f is not page.main_frame and (hit := await _scan_for_csv(f)):
-                return hit
-        return None
-
-    if hit := await _try_everywhere():
-        return hit
-
-    # フォームに submit 1 個だけパターン
-    submit_only = page.locator('form input[type="submit"]')
-    if await submit_only.count() == 1:
-        return submit_only.first
-
-    # ---------- failure debug ----------
-    html = await page.content()
-    head = "\n".join(html.splitlines()[:200])
-    tail = "\n".join(html.splitlines()[-50:])
-    print("===== page.content() head =====")
-    print(head)
-    print("===== page.content() tail =====")
-    print(tail)
-    print(f"URL   : {page.url}")
-    print(f"title : {await page.title()}")
-    print("================================")
-
-    raise RuntimeError("CSV ダウンロードリンクを検出できませんでした")
-# ---------- メイン ----------
-async def download_csv_async(out_dir: str, *, headless: bool = True):
+async def download_csv_async(
+    out_dir: str,
+    year: int,
+    month: int,
+    *,
+    headless: bool = True,
+) -> Path:
+    """指定年月（1–12）の CSV をダウンロードして保存し、ファイルパスを返す"""
     storage = _decode_storage()
-    async with async_playwright() as p:
-        browser = await p.chromium.launch(headless=headless)
-        ctx_kw  = dict(storage_state=storage) if storage else {}
-        context = await browser.new_context(**ctx_kw)
-        page    = await context.new_page()
+    async with async_playwright() as pw:
+        browser: Browser = await pw.chromium.launch(headless=headless)
+        context = (
+            await browser.new_context(storage_state=storage)
+            if storage
+            else await browser.new_context()
+        )
+        page = await context.new_page()
 
-        await page.goto(DL_PAGE_URL, wait_until="networkidle")
-        if page.url.startswith("https://id.moneyforward.com"):
-            raise RuntimeError("未ログインです。storageState.json を再取得してください。")
+        # Cookieが無効ならログインして storageState をキャッシュ（次回用）
+        if not storage:
+            await _login(page)
+            state = await context.storage_state()
+            packed = gzip.compress(json.dumps(state).encode())
+            print(
+                "\n=== 新しい MF_STORAGE_B64（gzip+base64） ===\n"
+                + base64.b64encode(packed).decode()
+                + "\n=========================================\n"
+            )
 
-        target = await _find_csv_link(page)
+        # 直接 GET で取得
+        csv_url = _build_csv_url(year, month)
+        resp = await context.request.get(csv_url)
+        if resp.status != 200:
+            raise RuntimeError(f"CSV ダウンロード失敗: {resp.status} {csv_url}")
 
-        # Download オブジェクト or Locator のどちらにも対応
-        if hasattr(target, "save_as"):
-            download = target
-        else:
-            async with page.expect_download(timeout=WAIT) as dlinfo:
-                await target.click()
-            download = await dlinfo.value
+        csv_path = Path(out_dir) / f"mf_{year}{month:02d}.csv"
+        csv_path.write_bytes(await resp.body())
 
-        dst = Path(out_dir) / download.suggested_filename
-        await download.save_as(dst)
+        await context.close()
         await browser.close()
-        return dst
+        return csv_path
+
+
+# ------------------------------------------------------------------------------
+# 手動実行用
+# ------------------------------------------------------------------------------
+if __name__ == "__main__":
+    async def _run() -> None:
+        tmp = tempfile.gettempdir()
+        # 例: 最新月を自動計算
+        today = date.today()
+        await download_csv_async(tmp, today.year, today.month)
+        print("download OK ->", tmp)
+
+    asyncio.run(_run())
