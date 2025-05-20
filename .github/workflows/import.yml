@@ -14,35 +14,29 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      # 1) リポジトリをチェックアウト
       - name: Checkout code
         uses: actions/checkout@v4
 
-      # 2) upload-artifact アクションをローカルにチェックアウト
       - name: Checkout upload-artifact action
         uses: actions/checkout@v4
         with:
           repository: actions/upload-artifact
           path: ./.github/actions/upload-artifact
 
-      # 3) Python セットアップ
       - name: Set up Python
         uses: actions/setup-python@v4
         with:
           python-version: '3.12'
 
-      # 4) 依存ライブラリをインストール
       - name: Install dependencies
         run: pip install -r requirements.txt
 
-      # 5) 実行対象の年月を取得
       - name: Get year/month
         id: yymm
         run: |
           echo "year=$(date -u +'%Y')"   >> $GITHUB_OUTPUT
           echo "month=$(date -u +'%m')"  >> $GITHUB_OUTPUT
 
-      # 6) Importer 実行（失敗しても次に進む）
       - name: Run importer
         env:
           MF_EMAIL:       ${{ secrets.MF_EMAIL }}
@@ -53,9 +47,8 @@ jobs:
         run: |
           python -m src.main || true
 
-      # 7) 失敗時にローカル・アクションでスクリーンショットアップロード
       - name: Upload login screenshot
-        if: failure()
+        if: always()
         uses: ./.github/actions/upload-artifact
         with:
           name: login-screenshot
