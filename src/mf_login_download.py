@@ -1,120 +1,61 @@
-# src/mf_login_download.py
-#
-# MoneyForward から “収入・支出詳細” CSV をダウンロードするユーティリティ
-# ------------------------------------------------------------
-# ・環境変数 MF_EMAIL / MF_PASSWORD で認証
-# ・Playwright（async）を使用
-# ・ヘッドレス／GUI は引数で切替
-# ------------------------------------------------------------
-from __future__ import annotations
-
-import argparse
-import asyncio
-import os
-import tempfile
-from datetime import datetime
+import asyncio, os, tempfile, time, base64, json
 from pathlib import Path
-from typing import Final
+from playwright.async_api import async_playwright
 
-from playwright.async_api import async_playwright, TimeoutError as PWTimeout
+LOGIN_URL   = "https://moneyforward.com/cf"
+EMAIL_SELECTOR = 'input[name="email"], input[name="mfid_user[email]"]'
+PASS_SELECTOR  = 'input[type="password"], input[name="mfid_user[password]"]'
+DL_MENU_TEXT   = "ダウンロード"
+CSV_LINK_TEXT  = "CSVファイル"
 
-MF_ID_URL:   Final = "https://id.moneyforward.com/sign_in"
-MF_CF_URL:   Final = "https://moneyforward.com/cf"
+async def _login(page):
+    email    = os.environ["MF_EMAIL"]
+    password = os.environ["MF_PASSWORD"]
 
-EMAIL  = os.getenv("MF_EMAIL")
-PWD    = os.getenv("MF_PASSWORD")
-
-if not EMAIL or not PWD:
-    raise EnvironmentError("MF_EMAIL / MF_PASSWORD が環境変数に設定されていません。")
-
-
-# ----------------------------------------------------------------------
-# 内部ヘルパ
-# ----------------------------------------------------------------------
-async def _login(page) -> None:
-    """MoneyForward ID でログイン (必要ならメールリンクをクリックして展開)"""
-    await page.goto(MF_ID_URL, wait_until="domcontentloaded")
-
-    # --- フォームを開く -------------------------------------------------
-    # 「メールアドレスでログイン」リンクがあればクリック
-    if await page.locator('text="メールアドレスでログイン"').count():
-        await page.click('text="メールアドレスでログイン"')
-
-    # 入力欄が現れるまで最大 90 秒待つ
     try:
-        await page.wait_for_selector('input[name="email"]', timeout=90_000)
-    except PWTimeout as e:
+        await page.wait_for_selector(EMAIL_SELECTOR, timeout=90_000)
+        await page.fill(EMAIL_SELECTOR, email)
+        await page.fill(PASS_SELECTOR,  password)
+        await page.press(PASS_SELECTOR, "Enter")
+    except Exception as e:
         raise RuntimeError("ログインフォームが描画されずタイムアウトしました") from e
 
-    # --- 認証情報を入力 -------------------------------------------------
-    await page.fill('input[name="email"]', EMAIL)
-    await page.fill('input[name="password"]', PWD)
-    await page.click('button[type="submit"]')
+    # ログイン完了待ち（サイドバーが出るなど）
+    await page.wait_for_url("**/cf", timeout=90_000)
 
-    # 完全に遷移するまで待機
-    await page.wait_for_url(lambda url: "sign_in" not in url, timeout=90_000)
+async def _restore_storage(context):
+    b64 = os.getenv("MF_STORAGE_B64")
+    if not b64:
+        return False
+    state_path = Path(tempfile.gettempdir()) / f"mf_state_{int(time.time())}.json"
+    state_path.write_bytes(base64.b64decode(b64))
+    await context.add_cookies([])
+    context.storage_state(path=str(state_path))
+    return True
 
-
-# ----------------------------------------------------------------------
-# 外部 API
-# ----------------------------------------------------------------------
-async def download_csv_async(tmp_dir: str | Path, *, headless: bool = True) -> Path:
-    """
-    CSV を tmp_dir に保存してその Path を返す
-    """
-    tmp_dir = Path(tmp_dir)
-    tmp_dir.mkdir(parents=True, exist_ok=True)
-
+async def download_csv_async(tmpdir: str, headless=True) -> Path:
     async with async_playwright() as p:
-        browser = await p.chromium.launch(headless=headless, args=["--no-sandbox"])
-        context = await browser.new_context(
-            **(p.devices["Desktop Chrome HiDPI"] if headless else {})
-        )
-        page = await context.new_page()
+        browser = await p.chromium.launch(headless=headless)
+        context = await browser.new_context()
+        page    = await context.new_page()
 
-        # ログインが必要かどうかを判定
-        await page.goto(MF_CF_URL, wait_until="domcontentloaded")
-        if "sign_in" in page.url:
+        # ① Cookie 復元（あれば）
+        if not await _restore_storage(context):
+            await page.goto(LOGIN_URL)
             await _login(page)
-            await page.goto(MF_CF_URL, wait_until="networkidle")
 
-        # ダウンロードメニューを開く
-        # 家計簿ページの上部バーにあるアイコン (DOM 側は <i class="icon-download-alt">)
-        await page.click('i.icon-download-alt')
+            # 新しい storageState を出力（ローカル開発用）
+            state = await context.storage_state()
+            (Path(tmpdir) / "storageState.json").write_text(json.dumps(state, ensure_ascii=False))
 
-        # "CSVファイル" をクリックして download
-        async with page.expect_download() as dl_info:
-            await page.get_by_role("link", name="CSVファイル").click()
-        dl = await dl_info.value
+        # ② CSV ダウンロード
+        await page.goto(LOGIN_URL)
+        await page.get_by_role("link", name=DL_MENU_TEXT).click()
+        async with page.expect_download(timeout=60_000) as dl_info:
+            await page.get_by_role("link", name=CSV_LINK_TEXT).click()
+        download = await dl_info.value
+        out_path = Path(tmpdir) / download.suggested_filename
+        await download.save_as(out_path)
 
-        # ファイル名を日付入りで置き換え保存
-        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-        csv_path = tmp_dir / f"収入・支出詳細_{ts}.csv"
-        await dl.save_as(csv_path)
-
-        await context.close()
         await browser.close()
-
-    return csv_path
-
-
-# ----------------------------------------------------------------------
-# CLI
-# ----------------------------------------------------------------------
-def _cli() -> None:
-    parser = argparse.ArgumentParser(description="MoneyForward CSV downloader")
-    parser.add_argument(
-        "--headless", action="store_true", help="Run browser in headless mode (default)"
-    )
-    parser.add_argument(
-        "--with-gui", action="store_true", help="Run browser with GUI (overrides --headless)"
-    )
-    args = parser.parse_args()
-
-    headless = not args.with_gui
-    out = asyncio.run(download_csv_async(tempfile.gettempdir(), headless=headless))
-    print(f"✓ Downloaded: {out}")
-
-
-if __name__ == "__main__":
-    _cli()
+        return out_path
