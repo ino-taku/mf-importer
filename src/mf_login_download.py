@@ -53,7 +53,9 @@ async def _login_if_needed(page: Page) -> None:
     frame = await _find_login_frame(page)
     if frame is None:
         print("=== UA :", await page.evaluate("() => navigator.userAgent"))
-        print(await page.content()[:1500], "...\n")
+        # await してからスライスする
+        html = await page.content()
+        print(html[:1500], "...\n")
         raise RuntimeError("ログインフォームを検出できませんでした (iframe 含む)")
 
     await frame.fill(EMAIL_SEL, os.environ["MF_EMAIL"])
@@ -70,7 +72,6 @@ async def download_csv_async(out_dir: str | os.PathLike, year: int, month: int, 
 
     async with async_playwright() as pw:
         browser: Browser = await pw.firefox.launch(headless=headless)   # ← Firefox
-        # 空文字を指定すると UA‐CH ヘッダーが落ちる
         ch_headers = {
             "Sec-CH-UA": '""',
             "Sec-CH-UA-Mobile": '""',
