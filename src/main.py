@@ -1,7 +1,7 @@
 ﻿import asyncio, tempfile
 from .mf_login_download import download_csv_async
-from normalize          import normalize
-from gsheet             import upload_df
+from .normalize          import normalize
+from .gsheet             import upload_df
 
 async def run_once() -> None:
     # 1) MoneyForward から最新 CSV を落とす
