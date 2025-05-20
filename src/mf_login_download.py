@@ -1,142 +1,84 @@
-# -*- coding: utf-8 -*-
-"""
-MoneyForward 明細画面から CSV をダウンロードするユーティリティ
------------------------------------------------------------------
-* 2025-05-21  MF 新 UI (エクスポート→CSV) に対応
-              - 事前に「エクスポート」をクリック
-              - CSV リンク検出を強化
-"""
-
-import asyncio
-import base64
-import gzip
-import json
-import os
-import re
-import tempfile
+import asyncio, base64, gzip, json, os, tempfile
 from pathlib import Path
-from typing import Optional
+from playwright.async_api import async_playwright, TimeoutError as PWTimeout
 
-from playwright.async_api import BrowserContext, Page, async_playwright
+# ----------------------------------------
+# 定数
+# ----------------------------------------
+HOME_URL          = "https://moneyforward.com/"
+DL_PAGE_URL       = "https://moneyforward.com/cf/csv"
+CSV_LINK_TEXT_JP  = "CSVファイル"          # 画面に表示される日本語リンク
+CSV_HREF_PATTERN  = 'a[href$=".csv"], a[href*=".csv?"]'  # href に .csv が入る全リンク
+WAIT              = 30_000                # ms
+STORAGE_ENV       = "MF_STORAGE_B64"      # Secrets に登録した Base64 文字列
 
-LOGIN_URL = "https://id.moneyforward.com/sign_in"
-MONEY_URL = "https://moneyforward.com/"
-
-EMAIL_SELECTOR = 'input[name="email"], input[name="mfid_user[email]"]'
-PASS_SELECTOR = 'input[type="password"], input[name="mfid_user[password]"]'
-
-CSV_PATTERNS = [
-    'a:has-text("CSVファイル")',
-    'a:has-text("CSV")',
-    'a[href*=".csv"]',
-    'a[href*="csv_download"]',
-    'button:has-text("CSV")',
-    'text=/CSV.*ダウンロード/i',
-]
-
-EXPORT_BUTTON_TEXTS = ["エクスポート", "ダウンロード", "明細をエクスポート"]
-
-
-# --------------------------------------------------------------------------- #
-# 認証
-# --------------------------------------------------------------------------- #
-async def _login(page: Page) -> None:
-    """フォームログイン（ストレージが無い場合のみ）"""
-    await page.goto(LOGIN_URL, wait_until="domcontentloaded")
-    await page.wait_for_selector(EMAIL_SELECTOR, timeout=90_000)
-    await page.fill(EMAIL_SELECTOR, os.environ["MF_EMAIL"])
-    await page.fill(PASS_SELECTOR, os.environ["MF_PASSWORD"])
-    await page.click('button[type="submit"]')
-    await page.wait_for_load_state("networkidle")
-
-
-def _decode_storage_state() -> Optional[dict]:
-    b64 = os.getenv("MF_STORAGE_B64")
+# ----------------------------------------
+# 辞書 → gzip → base64 で圧縮した storageState.json を復元
+# ----------------------------------------
+def _decode_storage() -> Path | None:
+    b64 = os.getenv(STORAGE_ENV)
     if not b64:
         return None
     raw = base64.b64decode(b64)
     try:
         raw = gzip.decompress(raw)
-    except gzip.BadGzipFile:
+    except OSError:  # 非圧縮の場合
         pass
-    return json.loads(raw)
+    tmp = Path(tempfile.gettempdir()) / "storageState.json"
+    tmp.write_bytes(raw)
+    return tmp
 
+# ----------------------------------------
+async def _find_csv_link(page):
+    """
+    1. ARIA ロール   <a role="link" name="CSVファイル">
+    2. href に .csv を含むリンク
+    3. SVG アイコン付き <i class="icon-download-alt"> の親リンク
+    """
+    # 1. アクセシビリティロケータ
+    try:
+        link = page.get_by_role("link", name=CSV_LINK_TEXT_JP)
+        await link.wait_for(timeout=WAIT)
+        return link
+    except PWTimeout:
+        pass
 
-# --------------------------------------------------------------------------- #
-# CSV リンク検出
-# --------------------------------------------------------------------------- #
-async def _click_export_if_exists(page: Page) -> None:
-    for txt in EXPORT_BUTTON_TEXTS:
-        try:
-            await page.get_by_text(txt, exact=False).first.click(timeout=3_000)
-            return
-        except Exception:
-            continue
+    # 2. href に .csv
+    csv_candidates = page.locator(CSV_HREF_PATTERN)
+    if await csv_candidates.count():
+        return csv_candidates.first
 
-
-async def _find_csv_link(page: Page) -> Page:
-    # まず「エクスポート」ボタンをクリックしてメニューを開く
-    await _click_export_if_exists(page)
-
-    # ① パターンに一致する Locator を順に探す
-    for css in CSV_PATTERNS:
-        loc = page.locator(css).first
-        try:
-            await loc.wait_for(state="visible", timeout=10_000)
-            return loc
-        except Exception:
-            continue
-
-    # ② すべてのリンク／ボタンを総当たりで調査
-    candidates = page.locator("a, button")
-    for i in range(await candidates.count()):
-        el = candidates.nth(i)
-        try:
-            text = (await el.inner_text()).strip()
-            href = await el.get_attribute("href") or ""
-        except Exception:
-            continue
-        if re.search(r"csv|ＣＳＶ", text, re.I) or re.search(r"csv", href, re.I):
-            return el
+    # 3. DL アイコン
+    icon_parent = page.locator("i.icon-download-alt").locator("..")
+    if await icon_parent.count():
+        return icon_parent.first
 
     raise RuntimeError("CSV ダウンロードリンクを検出できませんでした")
 
-
-# --------------------------------------------------------------------------- #
-# main download routine
-# --------------------------------------------------------------------------- #
-async def download_csv_async(tmp_dir: str, *, headless: bool = True) -> Path:
+# ----------------------------------------
+async def download_csv_async(out_dir: str, headless: bool = True) -> Path:
     async with async_playwright() as p:
         browser = await p.chromium.launch(headless=headless)
-        context_kwargs = {}
-        if (st := _decode_storage_state()):
-            tmpjson = Path(tmp_dir) / "mf_state.json"
-            tmpjson.write_text(json.dumps(st), encoding="utf-8")
-            context_kwargs["storage_state"] = tmpjson
+        storage   = _decode_storage()
+        context   = await browser.new_context(storage_state=storage) if storage else await browser.new_context()
+        page      = await context.new_page()
 
-        context: BrowserContext = await browser.new_context(**context_kwargs)
-        page: Page = await context.new_page()
-        await page.goto(MONEY_URL, wait_until="domcontentloaded")
+        # 1. ターゲットページへ
+        await page.goto(DL_PAGE_URL, wait_until="networkidle")
 
-        if not st:
-            await _login(page)
+        # 2. ログインが必要なら自動遷移（storageState が無いケース）
+        if page.url.startswith("https://id.moneyforward.com"):
+            raise RuntimeError("未ログインです。storageState.json を取得して MF_STORAGE_B64 に設定してください。")
 
+        # 3. CSV ダウンロードリンクを検出
         link = await _find_csv_link(page)
 
-        async with page.expect_download() as info:
+        # 4. ダウンロードを待ち受けてクリック
+        async with page.expect_download() as dl_info:
             await link.click()
-        dl = await info.value
-        outfile = Path(tmp_dir) / dl.suggested_filename
-        await dl.save_as(outfile)
+        download = await dl_info.value
+        csv_path = Path(out_dir) / download.suggested_filename
+        await download.save_as(csv_path)
 
-        await context.close()
         await browser.close()
-        return outfile
-
-
-# --------------------------------------------------------------------------- #
-# CLI テスト
-# --------------------------------------------------------------------------- #
-if __name__ == "__main__":
-    out = asyncio.run(download_csv_async(tempfile.gettempdir(), headless=False))
-    print("Saved:", out)
+        return csv_path
