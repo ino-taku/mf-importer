@@ -3,7 +3,7 @@ from pathlib import Path
 from playwright.async_api import async_playwright, Page, TimeoutError as PWTimeout
 
 HOME_URL    = "https://moneyforward.com/"
-DL_PAGE_URL = "https://moneyforward.com/cf/csv"
+DL_PAGE_URL = "https://moneyforward.com/cf/export"   # ← 修正
 WAIT        = 30_000
 STORAGE_ENV = "MF_STORAGE_B64"
 
@@ -25,24 +25,26 @@ def _decode_storage() -> Path | None:
     return tmp
 
 # ---------- 汎用: “CSV” を探す ----------
-async def _scan_for_csv(scope):
-    # 1)  href*.csv
+async def _scan_for_csv(scope: Page):
+    # a)  href に .csv
     link = scope.locator('a[href$=".csv"], a[href*=".csv?"]')
     if await link.count():
         return link.first
 
-    # 2)  全角/半角「CSV」を含む可視テキスト
+    # b)  テキストに CSV
     node = scope.locator(
-        ':is(a,button,span,div,li):not([role="presentation"])',
+        ':is(a,button,input,span,div,li):not([role="presentation"])',
         has_text=CSV_RE
     )
     if await node.count():
         return node.first
 
-    # 3)  「CSVファイル」「ＣＳＶファイル」など
-    node2 = scope.locator(':is(a,button):text-matches("Ｃ?Ｓ?Ｖ?ファイル")')
-    if await node2.count():
-        return node2.first
+    # c)  submit ボタン value に CSV
+    btn = scope.locator('input[type="submit"]')
+    for i in range(await btn.count()):
+        v = (await btn.nth(i).get_attribute("value")) or ""
+        if CSV_RE.search(v):
+            return btn.nth(i)
 
     return None
 
@@ -58,24 +60,13 @@ async def _find_csv_link(page: Page):
                 return hit
         return None
 
-    # 直撃
     if (hit := await _try_everywhere()):
         return hit
 
-    # ダウンロードアイコン → ドロップダウン開く
-    icon = page.locator('i[class*="download"], i.icon-download-alt')
-    if await icon.count():
-        await icon.first.click()
-        await page.wait_for_timeout(800)
-        if (hit := await _try_everywhere()):
-            return hit
-
-    # さらにスクロールしながらリトライ
-    for _ in range(4):
-        await page.mouse.wheel(0, 800)
-        await page.wait_for_timeout(400)
-        if (hit := await _try_everywhere()):
-            return hit
+    # エクスポート画面はフォーム１つ＋submit１つだけの場合が多い → 自動で拾う
+    submit_only = page.locator('form input[type="submit"]')
+    if await submit_only.count() == 1:
+        return submit_only.first
 
     raise RuntimeError("CSV ダウンロードリンクを検出できませんでした")
 
@@ -94,7 +85,7 @@ async def download_csv_async(out_dir: str, *, headless: bool = True):
 
         target = await _find_csv_link(page)
 
-        # Download オブジェクト or Locator
+        # Download オブジェクト or Locator のどちらにも対応
         if hasattr(target, "save_as"):
             download = target
         else:
