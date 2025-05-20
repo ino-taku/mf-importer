@@ -1,20 +1,22 @@
-# src/mf_login_download.py
-
 import asyncio
-from playwright.async_api import async_playwright, Page
+import base64
+import gzip
 import json
+import os
+from playwright.async_api import async_playwright, Page
 
 async def _login_if_needed(page: Page):
-    # ログインページに遷移
+    # Money Forward のログインページへ
     await page.goto("https://id.moneyforward.com/me", timeout=60_000)
 
-    # **【追加】** 常にスクリーンショットを撮ってログ保存
-    await page.screenshot(path="login_issue.png", full_page=True)
-
-    # ページソースを確認
+    # ページ HTML を取得
     html = await page.content()
+
+    # ログインフォームが無ければ失敗扱い
     if "ログイン" not in html and "login" not in html.lower():
-        # フォーム要素が見つからない場合はログと例外
+        # 失敗時のみスクリーンショットを残す
+        await page.screenshot(path="login_issue.png", full_page=True)
+        # ログのため先頭を出力
         print(html[:1500], "...\n")
         raise RuntimeError("ログインフォームを検出できませんでした (iframe 含む)")
 
@@ -29,15 +31,13 @@ async def download_csv_async() -> str:
                 "--disable-setuid-sandbox",
             ]
         )
-        # ストレージ状態（環境変数から）
+
+        # storageState を環境変数から復元
         storage_b64 = os.getenv("MF_STORAGE_B64", "")
         storage_json = json.loads(
-            asyncio.get_event_loop().run_in_executor(None,
-                lambda: json.loads(
-                    gzip.decompress(base64.b64decode(storage_b64)).decode()
-                )
-            )
+            gzip.decompress(base64.b64decode(storage_b64)).decode()
         )
+
         context = await browser.new_context(
             user_agent=(
                 "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
@@ -46,6 +46,7 @@ async def download_csv_async() -> str:
             locale="ja-JP",
             storage_state=storage_json,
         )
+
         # stealth スクリプト
         await context.add_init_script("""
             Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
@@ -53,11 +54,13 @@ async def download_csv_async() -> str:
         """)
         page = await context.new_page()
 
-        # ログインチェック（常にスクショ済み）
+        # ログインチェック（失敗時にのみスクショ＆例外）
         await _login_if_needed(page)
 
-        # CSV ダウンロードのロジック（省略）
+        # CSV ダウンロード処理（省略）
+        # 例: await page.request.get(...)
         # ...
+
         await browser.close()
         return "downloaded.csv"
 

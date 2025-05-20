@@ -1,9 +1,9 @@
 ﻿name: Daily MoneyForward import
 
 on:
-  workflow_dispatch:
+  workflow_dispatch:          # 手動実行
   schedule:
-    - cron: '0 0 * * *'    # 毎日 09:00 JST
+    - cron: '0 0 * * *'       # 毎日 09:00 JST
   push:
     branches:
       - main
@@ -17,6 +17,7 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
 
+      # vendor 化しておいた upload-artifact
       - name: Checkout upload-artifact action
         uses: actions/checkout@v4
         with:
@@ -44,11 +45,10 @@ jobs:
           MF_STORAGE_B64: ${{ secrets.MF_STORAGE_B64 }}
           YEAR:           ${{ steps.yymm.outputs.year }}
           MONTH:          ${{ steps.yymm.outputs.month }}
-        run: |
-          python -m src.main || true
+        run: python -m src.main
 
-      - name: Upload login screenshot
-        if: always()
+      - name: Upload login screenshot on failure
+        if: failure()
         uses: ./.github/actions/upload-artifact
         with:
           name: login-screenshot
