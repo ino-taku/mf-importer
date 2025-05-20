@@ -1,112 +1,100 @@
-"""
-MoneyForward から家計簿 CSV をダウンロードするユーティリティ
----------------------------------------------------------------
-* Playwright  + Chromium
-* GitHub Actions 用にヘッドレス動作＆ログイン状態の再利用に対応
-"""
-
-from __future__ import annotations
-
 import asyncio
 import base64
 import gzip
-import json
 import os
 import tempfile
 from pathlib import Path
-from typing import Final, Optional
 
-from playwright.async_api import Page, async_playwright
+from playwright.async_api import async_playwright, TimeoutError as PwTimeout
 
-# ─────────────────────────  セレクタ類  ──────────────────────────
-EMAIL_SELECTOR: Final = 'input[name="email"], input[name="mfid_user[email]"]'
-PASS_SELECTOR:  Final = 'input[type="password"]'
-DL_ICON_CSS:    Final = 'a i.icon-download-alt'     # 親 <a> がダウンロードリンク
-CSV_LINK_TEXT:  Final = "CSVファイル"               # ダウンロードダイアログ内リンク
+#―――――――― 環境変数 ――――――――#
+MF_STORAGE_B64 = os.getenv("MF_STORAGE_B64", "")
+MF_EMAIL       = os.getenv("MF_EMAIL", "")
+MF_PASSWORD    = os.getenv("MF_PASSWORD", "")
 
-# ───────────────────────  ストレージの読み込み  ──────────────────────
-def _load_storage() -> Optional[str]:
-    """
-    環境変数 **MF_STORAGE_B64** に保存された storageState.json (base64; gz 可)
-    をデコードして一時ファイルに展開し、そのパスを返す。
-    変数が無ければ None（＝新規ログインが必要）。
-    """
-    b64 = os.getenv("MF_STORAGE_B64")
-    if not b64:
+# 直リンクでダウンロード画面へ
+DL_URL          = "https://moneyforward.com/cf/download"
+CSV_LINK_TEXT   = "CSVファイル"          # ボタンの可視テキスト
+
+EMAIL_SELECTOR  = 'input[name="email"], input[name="mfid_user[email]"]'
+PASS_SELECTOR   = 'input[name="password"], input[name="mfid_user[password]"]'
+
+#―――――――― ヘルパ ――――――――#
+def _load_storage() -> dict | None:
+    if not MF_STORAGE_B64:
         return None
-
-    raw = base64.b64decode(b64)
-    try:                     # gz かどうか判定
+    raw = base64.b64decode(MF_STORAGE_B64)
+    try:                      # gzip 圧縮→展開
         raw = gzip.decompress(raw)
-    except OSError:
+    except gzip.BadGzipFile:
         pass
-
-    tmp = Path(tempfile.gettempdir()) / "storageState.json"
-    tmp.write_bytes(raw)
-    return str(tmp)
+    return raw.decode("utf-8")
 
 
-# ─────────────────────────  ログイン処理  ──────────────────────────
-async def _login(page: Page) -> None:
-    """メールアドレス / パスワードを入力してログイン"""
-    mf_id = os.environ["MF_EMAIL"]
-    mf_pw = os.environ["MF_PASSWORD"]
-
-    # フォームが出るまで最大 90 s 待機
-    await page.wait_for_selector(EMAIL_SELECTOR, timeout=90_000)
-    await page.fill(EMAIL_SELECTOR, mf_id)
-    await page.fill(PASS_SELECTOR,  mf_pw)
-    await page.press(PASS_SELECTOR, "Enter")
-
-    # 家計簿トップへリダイレクトされるまで待機
-    await page.wait_for_url("https://moneyforward.com/cf", timeout=90_000)
+async def _login(page):
+    """メール/パスワード入力を伴うログイン。
+    保存済み storageState が使えれば呼ばれない。"""
+    try:
+        await page.wait_for_selector(EMAIL_SELECTOR, timeout=90_000)
+        await page.fill(EMAIL_SELECTOR, MF_EMAIL)
+        await page.fill(PASS_SELECTOR,  MF_PASSWORD)
+        await page.keyboard.press("Enter")
+        # ログイン成功まで待つ（家計簿トップが出れば OK）
+        await page.wait_for_url("**/cf", timeout=90_000)
+    except PwTimeout as e:
+        raise RuntimeError("ログインフォームの検出に失敗しました") from e
 
 
-# ──────────────────  メイン: CSV を temp に保存して返す  ───────────────
+#―――――――― メイン ――――――――#
 async def download_csv_async(tmp_dir: str, *, headless: bool = True) -> Path:
-    """CSV ファイルを tmp_dir にダウンロードし Path を返す"""
-    storage_state = _load_storage()
-
-    async with async_playwright() as pw:
-        browser = await pw.chromium.launch(
-            headless=headless,
-            args=["--no-sandbox"],
+    async with async_playwright() as p:
+        browser = await p.chromium.launch(headless=headless)
+        context_kwargs = dict(
+            viewport={"width": 1280, "height": 960},
+            locale="ja-JP",
+            user_agent=p.devices["Desktop Chrome HiDPI"]["user_agent"],
         )
+        if st := _load_storage():
+            context_kwargs["storage_state"] = st
 
-        context = await browser.new_context(storage_state=storage_state)
-        page = await context.new_page()
+        context = await browser.new_context(**context_kwargs)
+        page    = await context.new_page()
 
-        # 家計簿トップ（要ログイン）
-        await page.goto("https://moneyforward.com/cf", wait_until="networkidle")
+        # 1️⃣ ダウンロード画面へ直行
+        await page.goto(DL_URL, wait_until="networkidle")
 
-        # storage が無い場合はログイン
-        if storage_state is None:
+        # もし storage が無効でログイン画面に飛ばされたらログインを試みる
+        if "/sign_in" in page.url:
             await _login(page)
-            # ログイン後の state を次回用に出力（ローカルでのみ利用）
-            if not headless:
-                await context.storage_state(path="storageState.json")
+            await page.goto(DL_URL, wait_until="networkidle")
 
-        # ▼▼▼ 1. ダウンロード画面へ（直リンクで確実に遷移） ▼▼▼
-        await page.goto("https://moneyforward.com/cf/download",
-                        wait_until="networkidle")
+        # 2️⃣ CSV リンクを待ってクリック
+        try:
+            link = page.get_by_role("link", name=CSV_LINK_TEXT)
+            await link.wait_for(timeout=30_000)
+        except PwTimeout as e:
+            # デバッグ用: 全リンクのテキストを出力して原因を掴む
+            txts = await page.locator("a").all_inner_texts()
+            raise RuntimeError(
+                f"CSV リンクが見つかりません。\n"
+                f"リンク一覧:\n{txts}"
+            ) from e
 
-        # ▼▼▼ 2. CSV ファイルをクリック ▼▼▼
-        await page.wait_for_selector(f'a:has-text("{CSV_LINK_TEXT}")', timeout=30_000)
         async with page.expect_download() as dl_info:
-            await page.get_by_role("link", name=CSV_LINK_TEXT).click()
+            await link.click()
+        dl = await dl_info.value
 
-        download = dl_info.value
-        csv_path = Path(tmp_dir) / download.suggested_filename
-        await download.save_as(str(csv_path))
-
+        # 3️⃣ Downloads フォルダ → 引数で渡された tmp_dir へ保存
+        dst = Path(tmp_dir) / dl.suggested_filename
+        await dl.save_as(dst)
+        await context.close()
         await browser.close()
-        return csv_path
+        return dst
 
 
-# ────────────────────────────────  CLI  ───────────────────────────────
+#―――――――― CLI 実行時 ――――――――#
 if __name__ == "__main__":
-    async def _wrap():
-        path = await download_csv_async(tempfile.gettempdir(), headless=False)
-        print("Downloaded ->", path)
-
-    asyncio.run(_wrap())
+    csv_path = asyncio.run(
+        download_csv_async(tempfile.gettempdir(), headless=False)
+    )
+    print("Downloaded:", csv_path)
