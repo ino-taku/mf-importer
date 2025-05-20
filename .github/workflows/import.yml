@@ -28,5 +28,6 @@ jobs:
           MF_PASSWORD:         ${{ secrets.MF_PASSWORD }}
           GSHEET_KEY:          ${{ secrets.GSHEET_KEY }}
           GSHEET_SERVICE_JSON: ${{ secrets.GSHEET_SERVICE_JSON }}
+          MF_STORAGE_B64:      ${{ secrets.MF_STORAGE_B64 }}
         run: |
           python src/main.py
