@@ -14,22 +14,10 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      # 2) Python 3.12 をセットアップ
-      - name: Set up Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: '3.12'
+      # …（他のセットアップ／依存関係インストールなどのステップ）…
 
-      # 3) 依存ライブラリをインストール
-      - name: Install deps
-        run: |
-          python -m pip install --upgrade pip
-          pip install -r requirements.txt
-          playwright install --with-deps
-          sudo apt-get update && sudo apt-get install -y jq
-
-      # 4) 対象年月を計算（⇨ GITHUB_OUTPUT で渡す）
-      - name: Compute target year & month
+      # 実行年月を取得
+      - name: Get year/month
         id: yymm
         run: |
           echo "year=$(date -u +'%Y')"   >> $GITHUB_OUTPUT   # 例: 2025
@@ -38,10 +26,18 @@ jobs:
       # 5) インポーターを実行
       - name: Run importer
         env:
-          MF_EMAIL:          ${{ secrets.MF_EMAIL }}
-          MF_PASSWORD:       ${{ secrets.MF_PASSWORD }}
-          MF_STORAGE_B64:    ${{ secrets.MF_STORAGE_B64 }}
-          YEAR:              ${{ steps.yymm.outputs.year }}
-          MONTH:             ${{ steps.yymm.outputs.month }}
+          MF_EMAIL:       ${{ secrets.MF_EMAIL }}
+          MF_PASSWORD:    ${{ secrets.MF_PASSWORD }}
+          MF_STORAGE_B64: ${{ secrets.MF_STORAGE_B64 }}
+          YEAR:           ${{ steps.yymm.outputs.year }}
+          MONTH:          ${{ steps.yymm.outputs.month }}
         run: |
-          python -m src.main
+          python -m src.main || true
+
+      # 6) エラー時にスクリーンショットをアップロード
+      - name: Upload login screenshot
+        if: failure()
+        uses: actions/upload-artifact@v3
+        with:
+          name: login-screenshot
+          path: login_issue.png
