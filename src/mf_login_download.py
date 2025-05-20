@@ -1,14 +1,14 @@
-import asyncio, base64, gzip, os, tempfile, re
+import asyncio, base64, gzip, os, re, tempfile
 from pathlib import Path
 from playwright.async_api import async_playwright, TimeoutError as PWTimeout
 
-HOME_URL         = "https://moneyforward.com/"
-DL_PAGE_URL      = "https://moneyforward.com/cf/csv"
-WAIT             = 30_000           # ms
-STORAGE_ENV      = "MF_STORAGE_B64" # Secret 名
-CSV_RE           = re.compile(r"csv", re.I)
+HOME_URL    = "https://moneyforward.com/"
+DL_PAGE_URL = "https://moneyforward.com/cf/csv"
+WAIT        = 30_000          # ms
+STORAGE_ENV = "MF_STORAGE_B64"
+CSV_RE      = re.compile(r"csv", re.I)
 
-# ---------- storageState (Base64 / gzip) ----------
+# ---------- storageState ----------
 def _decode_storage() -> Path | None:
     b64 = os.getenv(STORAGE_ENV)
     if not b64:
@@ -24,23 +24,35 @@ def _decode_storage() -> Path | None:
 
 # ---------- CSV リンク探索 ----------
 async def _find_csv_link(page):
-    # 1. 既に href=".csv" が存在すれば最速
-    csv_href = page.locator('a[href$=".csv"], a[href*=".csv?"]')
-    if await csv_href.count():
-        return csv_href.first
+    async def _try_find():
+        # 直リンク .csv
+        link = page.locator('a[href$=".csv"], a[href*=".csv?"]')
+        if await link.count():
+            return link.first
+        # “CSV” を含む a / button / span / div
+        node = page.locator(':is(a,button,span,div)', has_text=CSV_RE)
+        if await node.count():
+            return node.first
+        return None
 
-    # 2. innerText/aria-label に “csv” を含むリンク or ボタン
-    text_link = page.locator(":is(a,button)", has_text=CSV_RE)
-    if await text_link.count():
-        return text_link.first
+    # ① そのまま探す
+    if (hit := await _try_find()):
+        return hit
 
-    # 3. CSV ボタンを押すと JS が <a download> を生成する UI
-    #    → button をクリック → href=".csv" が出るまで待つ
-    csv_btn = page.locator(":is(button)", has_text=CSV_RE)
-    if await csv_btn.count():
-        async with page.expect_download(timeout=WAIT) as dl_info:
-            await csv_btn.first.click()
-        return dl_info.value  # expect_download が返す Download オブジェクト
+    # ② ダウンロードアイコンを押してメニュー展開
+    icon = page.locator('i[class*="download"], i.icon-download-alt')
+    if await icon.count():
+        await icon.first.click()
+        await page.wait_for_timeout(1_000)
+        if (hit := await _try_find()):
+            return hit
+
+    # ③ 下へスクロールしつつ再探索
+    for _ in range(3):
+        await page.mouse.wheel(0, 800)
+        await page.wait_for_timeout(500)
+        if (hit := await _try_find()):
+            return hit
 
     raise RuntimeError("CSV ダウンロードリンクを検出できませんでした")
 
@@ -49,25 +61,27 @@ async def download_csv_async(out_dir: str, headless: bool = True) -> Path:
     storage = _decode_storage()
     async with async_playwright() as p:
         browser = await p.chromium.launch(headless=headless)
-        context = await browser.new_context(storage_state=storage) if storage else await browser.new_context()
+        ctx_kw  = dict(storage_state=storage) if storage else {}
+        context = await browser.new_context(**ctx_kw)
         page    = await context.new_page()
 
         await page.goto(DL_PAGE_URL, wait_until="networkidle")
 
         if page.url.startswith("https://id.moneyforward.com"):
-            raise RuntimeError("未ログインです。storageState.json を再取得し Secret に登録してください。")
+            raise RuntimeError("未ログインです。storageState.json を再取得してください。")
 
         target = await _find_csv_link(page)
 
-        # target が Download オブジェクト (ケース③) か Locator かで分岐
+        # - 直 Download オブジェクト（メニュー→自動生成）か、
+        # - Locator かで処理分岐
         if hasattr(target, "save_as"):
-            download = target
+            download = target  # expect_download が返す Download
         else:
             async with page.expect_download(timeout=WAIT) as dl_info:
                 await target.click()
             download = await dl_info.value
 
-        csv_path = Path(out_dir) / download.suggested_filename
-        await download.save_as(csv_path)
+        dst = Path(out_dir) / download.suggested_filename
+        await download.save_as(dst)
         await browser.close()
-        return csv_path
+        return dst
