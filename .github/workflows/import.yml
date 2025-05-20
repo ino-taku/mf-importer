@@ -1,31 +1,42 @@
 ﻿name: Daily MoneyForward import
 
 on:
-  # 手動実行＆スケジュールに加え、プッシュ時にも実行
+  # 手動実行・スケジュール・プッシュで起動
   workflow_dispatch:
   schedule:
-    - cron:  '0 0 * * *'      # 毎日 09:00 JST
+    - cron: '0 0 * * *'      # 毎日 09:00 JST
   push:
     branches:
       - main
-      - 'fix/**'             # fix/ で始まるブランチをすべて監視
+      - 'fix/**'
 
 jobs:
   import:
     runs-on: ubuntu-latest
 
     steps:
+      # 1) リポジトリをチェックアウト
       - name: Checkout
         uses: actions/checkout@v4
 
-      # （Python セットアップなど必要なステップを挿入）
+      # 2) Python セットアップ
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.12'
 
+      # 3) 依存関係インストール
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      # 4) 実行対象の年月を取得
       - name: Get year/month
         id: yymm
         run: |
           echo "year=$(date -u +'%Y')"   >> $GITHUB_OUTPUT
           echo "month=$(date -u +'%m')"  >> $GITHUB_OUTPUT
 
+      # 5) インポーターを実行（失敗しても次に進む）
       - name: Run importer
         env:
           MF_EMAIL:       ${{ secrets.MF_EMAIL }}
@@ -36,9 +47,10 @@ jobs:
         run: |
           python -m src.main || true
 
+      # 6) エラー時にスクリーンショットをアップロード
       - name: Upload login screenshot
         if: failure()
-        uses: actions/upload-artifact@v3
+        uses: actions/upload-artifact@v2
         with:
           name: login-screenshot
           path: login_issue.png
