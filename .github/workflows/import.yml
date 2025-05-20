@@ -1,10 +1,9 @@
 ﻿name: Daily MoneyForward import
 
 on:
-  # 手動実行・スケジュール・プッシュで起動
   workflow_dispatch:
   schedule:
-    - cron: '0 0 * * *'      # 毎日 09:00 JST
+    - cron: '0 0 * * *'    # 毎日 09:00 JST
   push:
     branches:
       - main
@@ -16,27 +15,34 @@ jobs:
 
     steps:
       # 1) リポジトリをチェックアウト
-      - name: Checkout
+      - name: Checkout code
         uses: actions/checkout@v4
 
-      # 2) Python セットアップ
+      # 2) upload-artifact アクションをローカルにチェックアウト
+      - name: Checkout upload-artifact action
+        uses: actions/checkout@v4
+        with:
+          repository: actions/upload-artifact
+          path: ./.github/actions/upload-artifact
+
+      # 3) Python セットアップ
       - name: Set up Python
         uses: actions/setup-python@v4
         with:
           python-version: '3.12'
 
-      # 3) 依存関係インストール
+      # 4) 依存ライブラリをインストール
       - name: Install dependencies
         run: pip install -r requirements.txt
 
-      # 4) 実行対象の年月を取得
+      # 5) 実行対象の年月を取得
       - name: Get year/month
         id: yymm
         run: |
           echo "year=$(date -u +'%Y')"   >> $GITHUB_OUTPUT
           echo "month=$(date -u +'%m')"  >> $GITHUB_OUTPUT
 
-      # 5) インポーターを実行（失敗しても次に進む）
+      # 6) Importer 実行（失敗しても次に進む）
       - name: Run importer
         env:
           MF_EMAIL:       ${{ secrets.MF_EMAIL }}
@@ -47,10 +53,10 @@ jobs:
         run: |
           python -m src.main || true
 
-      # 6) エラー時にスクリーンショットをアップロード
+      # 7) 失敗時にローカル・アクションでスクリーンショットアップロード
       - name: Upload login screenshot
         if: failure()
-        uses: actions/upload-artifact@v2
+        uses: ./.github/actions/upload-artifact
         with:
           name: login-screenshot
           path: login_issue.png
