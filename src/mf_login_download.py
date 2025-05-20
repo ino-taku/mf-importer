@@ -1,10 +1,10 @@
 import asyncio, base64, gzip, os, re, tempfile
 from pathlib import Path
-from playwright.async_api import async_playwright, TimeoutError as PWTimeout
+from playwright.async_api import async_playwright, TimeoutError as PWTimeout, Page, FrameLocator
 
 HOME_URL    = "https://moneyforward.com/"
 DL_PAGE_URL = "https://moneyforward.com/cf/csv"
-WAIT        = 30_000          # ms
+WAIT        = 30_000           # ms
 STORAGE_ENV = "MF_STORAGE_B64"
 CSV_RE      = re.compile(r"csv", re.I)
 
@@ -22,42 +22,65 @@ def _decode_storage() -> Path | None:
     tmp.write_bytes(raw)
     return tmp
 
-# ---------- CSV リンク探索 ----------
-async def _find_csv_link(page):
-    async def _try_find():
-        # 直リンク .csv
-        link = page.locator('a[href$=".csv"], a[href*=".csv?"]')
-        if await link.count():
-            return link.first
-        # “CSV” を含む a / button / span / div
-        node = page.locator(':is(a,button,span,div)', has_text=CSV_RE)
-        if await node.count():
-            return node.first
+# ---------- 汎用: “CSV” を探す -------------
+async def _scan_for_csv(page_or_frame):
+    # 直リンク .csv
+    link = page_or_frame.locator('a[href$=".csv"], a[href*=".csv?"]')
+    if await link.count():
+        return link.first
+
+    # role=menuitem / link / button / div / span で “CSV” を含む
+    node = page_or_frame.locator(
+        ':is(a,button,span,div,li)[role!="presentation"]', has_text=CSV_RE
+    )
+    if await node.count():
+        return node.first
+    return None
+
+# ---------- CSV リンク探索 -------------
+async def _find_csv_link(page: Page):
+    async def _try_everywhere():
+        # 1) メインページ
+        if (hit := await _scan_for_csv(page)):
+            return hit
+        # 2) すべての iframe
+        for frame in page.frames:
+            if frame is not page.main_frame:
+                if (hit := await _scan_for_csv(frame)):
+                    return hit
         return None
 
-    # ① そのまま探す
-    if (hit := await _try_find()):
+    # ---- A. そのまま探す
+    if (hit := await _try_everywhere()):
         return hit
 
-    # ② ダウンロードアイコンを押してメニュー展開
+    # ---- B. download-icon クリック
     icon = page.locator('i[class*="download"], i.icon-download-alt')
     if await icon.count():
         await icon.first.click()
         await page.wait_for_timeout(1_000)
-        if (hit := await _try_find()):
+        if (hit := await _try_everywhere()):
             return hit
 
-    # ③ 下へスクロールしつつ再探索
+    # ---- C. dropdown-button クリック
+    dd_btn = page.locator('button[data-toggle="dropdown"], .dropdown-toggle')
+    if await dd_btn.count():
+        await dd_btn.first.click()
+        await page.wait_for_timeout(1_000)
+        if (hit := await _try_everywhere()):
+            return hit
+
+    # ---- D. スクロールしながらリトライ
     for _ in range(3):
         await page.mouse.wheel(0, 800)
         await page.wait_for_timeout(500)
-        if (hit := await _try_find()):
+        if (hit := await _try_everywhere()):
             return hit
 
     raise RuntimeError("CSV ダウンロードリンクを検出できませんでした")
 
 # ---------- メイン ----------
-async def download_csv_async(out_dir: str, headless: bool = True) -> Path:
+async def download_csv_async(out_dir: str, headless: bool = True):
     storage = _decode_storage()
     async with async_playwright() as p:
         browser = await p.chromium.launch(headless=headless)
@@ -66,16 +89,14 @@ async def download_csv_async(out_dir: str, headless: bool = True) -> Path:
         page    = await context.new_page()
 
         await page.goto(DL_PAGE_URL, wait_until="networkidle")
-
         if page.url.startswith("https://id.moneyforward.com"):
             raise RuntimeError("未ログインです。storageState.json を再取得してください。")
 
         target = await _find_csv_link(page)
 
-        # - 直 Download オブジェクト（メニュー→自動生成）か、
-        # - Locator かで処理分岐
-        if hasattr(target, "save_as"):
-            download = target  # expect_download が返す Download
+        # Download オブジェクト or Locator
+        if hasattr(target, "save_as"):          # already Download
+            download = target
         else:
             async with page.expect_download(timeout=WAIT) as dl_info:
                 await target.click()
