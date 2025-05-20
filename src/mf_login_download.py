@@ -1,6 +1,6 @@
 import asyncio, base64, gzip, os, re, tempfile
 from pathlib import Path
-from playwright.async_api import async_playwright, TimeoutError as PWTimeout, Page, FrameLocator
+from playwright.async_api import async_playwright, TimeoutError as PWTimeout, Page
 
 HOME_URL    = "https://moneyforward.com/"
 DL_PAGE_URL = "https://moneyforward.com/cf/csv"
@@ -29,9 +29,10 @@ async def _scan_for_csv(page_or_frame):
     if await link.count():
         return link.first
 
-    # role=menuitem / link / button / div / span で “CSV” を含む
+    # role≠presentation で “CSV” を含むテキスト
     node = page_or_frame.locator(
-        ':is(a,button,span,div,li)[role!="presentation"]', has_text=CSV_RE
+        ':is(a,button,span,div,li):not([role="presentation"])',
+        has_text=CSV_RE
     )
     if await node.count():
         return node.first
@@ -43,18 +44,18 @@ async def _find_csv_link(page: Page):
         # 1) メインページ
         if (hit := await _scan_for_csv(page)):
             return hit
-        # 2) すべての iframe
+        # 2) iframe 内
         for frame in page.frames:
             if frame is not page.main_frame:
                 if (hit := await _scan_for_csv(frame)):
                     return hit
         return None
 
-    # ---- A. そのまま探す
+    # ---- A. そのまま
     if (hit := await _try_everywhere()):
         return hit
 
-    # ---- B. download-icon クリック
+    # ---- B. download-icon
     icon = page.locator('i[class*="download"], i.icon-download-alt')
     if await icon.count():
         await icon.first.click()
@@ -62,7 +63,7 @@ async def _find_csv_link(page: Page):
         if (hit := await _try_everywhere()):
             return hit
 
-    # ---- C. dropdown-button クリック
+    # ---- C. dropdown-button
     dd_btn = page.locator('button[data-toggle="dropdown"], .dropdown-toggle')
     if await dd_btn.count():
         await dd_btn.first.click()
@@ -95,8 +96,8 @@ async def download_csv_async(out_dir: str, headless: bool = True):
         target = await _find_csv_link(page)
 
         # Download オブジェクト or Locator
-        if hasattr(target, "save_as"):          # already Download
-            download = target
+        if hasattr(target, "save_as"):
+            download = target            # すでに Download
         else:
             async with page.expect_download(timeout=WAIT) as dl_info:
                 await target.click()
