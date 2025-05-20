@@ -86,11 +86,11 @@ async def download_csv_async(tmp_dir: str, *, headless: bool = True) -> Path:
             if not headless:
                 await context.storage_state(path="storageState.json")
 
-        # ▼▼▼ 1. ダウンロード画面へ ▼▼▼
-        await page.wait_for_selector(DL_ICON_CSS, timeout=90_000)
-        await page.locator(DL_ICON_CSS).click()
+        # ▼▼▼ 1. ダウンロード画面へ（直リンクで確実に遷移） ▼▼▼
+        await page.goto("https://moneyforward.com/cf/download",
+                        wait_until="networkidle")
 
-        # ▼▼▼ 2. CSV ファイルを選択 ▼▼▼
+        # ▼▼▼ 2. CSV ファイルをクリック ▼▼▼
         await page.wait_for_selector(f'a:has-text("{CSV_LINK_TEXT}")', timeout=30_000)
         async with page.expect_download() as dl_info:
             await page.get_by_role("link", name=CSV_LINK_TEXT).click()
